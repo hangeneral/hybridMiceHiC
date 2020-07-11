@@ -1,0 +1,883 @@
+#!/usr/bin/env perl 
+#===============================================================================
+#
+#      COMPANY:  Group of Epigenome Biology, PICB
+#      VERSION:  1.0
+#      CREATED:  10/24/2013 11:01:13 AM
+#     REVISION:  ---
+#===============================================================================
+
+use strict;
+use warnings;
+use Getopt::Long;
+
+my %opts = (
+    'upstream'   => 2000,
+    'downstream' => 0,
+    'ratio'      => 0.5,
+);
+
+die <DATA> unless @ARGV;
+
+GetOptions(
+    \%opts,
+    'peak|p=s',          # peak file, BED format
+    'gene|g=s',          # gene file, BED or GTF format
+    'output|o=s',        # output file name
+    'upstream|u=i',      # upstream to TSS, as promoter, default is 5kb
+    'downstream|d=i',    # downstream to TES, default is 3kb
+    'ratio|r=f',         # overlap ratio to determine type, default is 0.5
+    'help|h',
+);
+
+die <DATA> if $opts{help};
+die <DATA> unless $opts{peak} and $opts{gene} and $opts{output};
+
+die "Genes annotation file should be in BED or GTF format!\n"
+  unless $opts{gene} =~ /\.bed$/i
+  or $opts{gene} =~ /\.gtf$/i;
+
+my %chr2gene;
+my %chr2peak;
+my $upstream    = $opts{upstream};
+my $downstream  = $opts{downstream};
+my $ratioCutoff = $opts{ratio};
+
+# read in peaks and store in %chr2peak
+_read_peaks_in_bed();
+
+# read in genes and store in %chr2gene
+# check BED or GTF format
+if ( $opts{gene} =~ /\.bed$/i ) {
+    _read_gene_annotation_in_bed();
+}
+else {
+    _read_gene_annotation_in_gtf();
+}
+
+# annotate peaks and output
+$opts{intergenic} = $opts{output};
+if ($opts{intergenic} =~ /\.(\w+)$/) {
+    $opts{intergenic} =~ s/\.(\w+)$/.intergenic.peaks.bed/;
+}
+else {
+    $opts{intergenic} .= '.intergenic.peaks.bed';
+}
+_annotate_peaks();
+
+# summarize binding type distribution
+#_summarize_binding_type_distribution();
+
+exit;
+
+##### FUNCTIONS DEFINITION #####
+sub _read_gene_annotation_in_bed {
+    my $in_file_name = $opts{gene};    # input file name
+    open my $in, '<', $in_file_name
+      or die "$0 : failed to open  input file '$in_file_name' : $!\n";
+
+    while (<$in>) {                    # BED12
+        chomp;
+        my @t = split /\t/;
+        @t[ 2, 7 ] = ( $t[2] - 1, $t[7] - 1 );    # BED is end-not-included
+        my %result = (
+            'tid'    => $t[3],                    # transcript_id
+            'gene'   => $t[12] ? $t[12] : '-',    # gene_name
+            'strand' => $t[5],
+            'blocks' => $t[9],
+        );
+        my @size  = split /,/, $t[10];
+        my @start = split /,/, $t[11];
+        $result{exons} =
+          [ map { [ $t[1] + $start[$_], $t[1] + $start[$_] + $size[$_] - 1 ] }
+              0 .. $t[9] - 1 ];
+        if ( $t[5] eq '+' ) {
+            $result{tss}   = $t[1];
+            $result{tes}   = $t[2];
+            $result{cds}   = $t[6];
+            $result{cde}   = $t[7];
+            $result{left}  = $t[1] - $upstream;
+            $result{right} = $t[2] + $downstream;
+        }
+        else {
+            $result{tss}   = $t[2];
+            $result{tes}   = $t[1];
+            $result{cds}   = $t[7];
+            $result{cde}   = $t[6];
+            $result{left}  = $t[1] - $downstream;
+            $result{right} = $t[2] + $upstream;
+        }
+        $result{coding} = $t[6] == $t[7] ? 0 : 1;    # protein coding or not
+
+        $chr2gene{ $t[0] }{ $. } = \%result;
+    }
+
+    close $in
+      or warn "$0 : failed to close input file '$in_file_name' : $!\n";
+}
+
+sub _read_gene_annotation_in_gtf {
+    my $in_file_name = $opts{gene};                  # input file name
+    open my $in, '<', $in_file_name
+      or die "$0 : failed to open  input file '$in_file_name' : $!\n";
+
+    my %transcripts;
+    while (<$in>) {
+
+        # GTF file must has start_codon and stop_codon for protein-coding genes
+        # for BED file, start_codon and stop_codon are included in CDS and CDE
+        # for GTF file, only start_codon is included in CDS
+        chomp;
+        my @t = split /\t/;
+        @t[ 3, 4 ] = ( $t[3] - 1, $t[4] - 1 );    # GTF is 1-based
+        $t[8] =~ s/"//g;
+        my %items;
+        for my $it ( split /;\s*/, $t[8] ) {
+            my ( $i, $j ) = split /\s+/, $it, 2;
+            $items{$i} = $j;
+        }
+        my $chr = $t[0];
+        my $number;
+        if (exists $transcripts{$chr}{$t[6]}{$items{transcript_id}}) {
+            $number = $transcripts{$chr}{$t[6]}{$items{transcript_id}};
+        }
+        else {
+            $transcripts{$chr}{$t[6]}{$items{transcript_id}} = $.;
+            $number = $.;
+            $items{gene_name} = $items{gene_id} unless $items{gene_name};
+            $chr2gene{$chr}{ $number }{strand} = $t[6];
+            $chr2gene{$chr}{ $number }{gene} = $items{gene_name};
+            $chr2gene{$chr}{ $number }{tid} = $items{transcript_id};
+        }
+        if ( $t[2] eq 'exon' ) {
+            push @{ $chr2gene{$chr}{ $number }{exons} }, [ @t[ 3, 4 ] ];
+        }
+        elsif ( $t[2] eq 'start_codon' ) {
+            if ( $t[6] eq '+' ) {
+                $chr2gene{$chr}{ $number }{cds} = $t[3];
+            }
+            else {
+                $chr2gene{$chr}{ $number }{cds} = $t[4];
+            }
+        }
+        elsif ( $t[2] eq 'stop_codon' ) {
+            if ( $t[6] eq '+' ) {
+                $chr2gene{$chr}{ $number }{cde} = $t[4];
+            }
+            else {
+                $chr2gene{$chr}{ $number }{cde} = $t[3];
+            }
+        }
+    }
+
+    close $in
+      or warn "$0 : failed to close input file '$in_file_name' : $!\n";
+
+    while ( my ( $chr, $trans_ref ) = each %chr2gene ) {
+        while ( my ( $tid, $t_ref ) = each %$trans_ref ) {
+            if ( $t_ref->{strand} eq '+' ) {
+                $t_ref->{tss}   = $t_ref->{exons}[0][0];
+                $t_ref->{tes}   = $t_ref->{exons}[-1][1];
+                $t_ref->{left}  = $t_ref->{tss} - $upstream;
+                $t_ref->{right} = $t_ref->{tes} + $downstream;
+                if ( exists $t_ref->{cds} ) {
+                    $t_ref->{coding} = 1;
+                }
+                else {
+                    $t_ref->{coding} = 0;
+                }
+            }
+            else {
+                $t_ref->{tss}   = $t_ref->{exons}[-1][1];
+                $t_ref->{tes}   = $t_ref->{exons}[0][0];
+                $t_ref->{left}  = $t_ref->{tes} - $downstream;
+                $t_ref->{right} = $t_ref->{tss} + $upstream;
+                if ( exists $t_ref->{cds} ) {
+                    $t_ref->{coding} = 1;
+                }
+                else {
+                    $t_ref->{coding} = 0;
+                }
+            }
+        }
+    }
+}
+
+sub _read_peaks_in_bed {
+    my $in_file_name = $opts{peak};    # input file name
+    open my $in, '<', $in_file_name
+      or die "$0 : failed to open  input file '$in_file_name' : $!\n";
+
+    my $peakNum = 0;
+    while (<$in>) {
+        chomp;
+        my @t = split /\t/;
+        unless ($t[0] =~ /^chr/ and $t[1] =~ /^\d+$/ and $t[2] =~ /^\d+$/) {
+            die "It seems line $.: '$_' isn't in correct BED format, which "
+                . "first column should start with 'chr', second and third "
+                . "cloumns should be positive integers.\n";
+        }
+        $t[3] = 'Peak_' . ( $peakNum++ ) unless $t[3];
+        $t[4] = 0 unless $t[4];
+        push @{ $chr2peak{ $t[0] } }, [ @t[ 1, 2, 3, 4 ] ];
+    }
+
+    close $in
+      or warn "$0 : failed to close input file '$in_file_name' : $!\n";
+}
+
+sub _annotate_peaks {
+    my $to_file_name = $opts{output};    # output file name
+    open my $to, '>', $to_file_name
+      or die "$0 : failed to open  output file '$to_file_name' : $!\n";
+
+    my $intergenic_file_name = "$opts{intergenic}";    # output file name
+    open my $intergenic, '>', $intergenic_file_name
+      or die "$0 : failed to open  output file '$intergenic_file_name' : $!\n";
+
+    # print header line
+    print {$to} join(
+        "\t", qw(chr peak_start peak_end peak_ID peak_score bindingType
+          gene_name distance2TSS strand
+          )
+      ),
+      "\n";
+    my @bindingTypes = qw(Promoter TSS UTR5 Exonic Intronic UTR3 TES 
+      Downstream Intergenic);
+    my %bindingTypes = map { $bindingTypes[$_], $_ } 0 .. $#bindingTypes;
+    my ( @sorted, $ratio, $regionLength, $overlapLength );
+    my ( @peaks, @genes, $tes, $tss, $tid, @exons, $cds, $cde );
+    my %summary;
+    for my $chr ( sort keys %chr2peak ) {
+        @peaks = sort { $a->[0] <=> $b->[0] or $a->[1] <=> $b->[1] }
+          @{ $chr2peak{$chr} };
+        unless ( exists $chr2gene{$chr} ) {
+            warn "$chr is not found in gene annotation file '$opts{gene}', "
+              . "peaks on this chromosome will not be annotated.\n";
+            next;
+        }
+        @genes =
+          sort { $a->{left} <=> $b->{left} or $a->{right} <=> $b->{right} }
+          values %{ $chr2gene{$chr} };
+
+        for my $peak_ref (@peaks) {
+            my ( $peakStart, $peakEnd, $peakName, $peakScore, $peakLength );
+            ( $peakStart, $peakEnd, $peakName, $peakScore ) = @$peak_ref;
+            $peakLength = $peakEnd - $peakStart + 1;
+            my ( %candidates, @store );
+            while (@genes) {
+                my %gene = %{ +shift @genes };
+
+                # if this gene has be annotated, it will contain type value
+                delete $gene{type} if exists $gene{type};
+                next
+                  if $peakStart > $gene{right};  # peak is at right part of gene
+                if ( $peakEnd < $gene{left} )
+                {    # peak is on the left part of gene
+                    unshift @genes, \%gene;
+                    last;
+                }
+                push @store, \%gene;
+
+                # check whether gene body overlap with peak
+                ( $tes, $tss, $tid ) = @gene{qw(tes tss tid)};
+                if ( $gene{strand} eq '+' ) {
+                    if ( $tes < $peakStart ) {    # can only be downstream
+                        @sorted = sort { $a <=> $b } $peakStart,
+                          $peakEnd, $gene{right}, $tes;
+                        $overlapLength = $sorted[2] - $sorted[1];
+                        $regionLength  = $gene{right} - $tes + 1;
+                        $ratio =
+                            $regionLength < $peakLength
+                          ? $overlapLength / $regionLength
+                          : $overlapLength / $peakLength;
+                        if ( $ratio >= $ratioCutoff ) {
+
+                            # check whether this gene has been processed before
+                            # since here is address-copy
+                            $candidates{left}{$tid} = \%gene;
+                            $candidates{left}{$tid}{type} =
+                              $bindingTypes{Downstream};
+
+                            # distance to TSS
+                            $candidates{left}{$tid}{distance} =
+                              $peakStart - $tss;
+                        }
+                    }
+                    elsif ( $tss > $peakEnd ) {    # check whether is promoter
+                        @sorted = sort { $a <=> $b } $peakStart,
+                          $peakEnd, $gene{left}, $tss;
+                        $overlapLength = $sorted[2] - $sorted[1];
+                        $regionLength  = $tss - $gene{left} + 1;
+                        $ratio =
+                            $regionLength < $peakLength
+                          ? $overlapLength / $regionLength
+                          : $overlapLength / $peakLength;
+                        if ( $ratio >= $ratioCutoff ) {
+                            $candidates{right}{$tid} = \%gene;
+                            $candidates{right}{$tid}{type} =
+                              $bindingTypes{Promoter};
+
+                            # distance to TSS
+                            $candidates{right}{$tid}{distance} =
+                              $tss - $peakEnd;
+                        }
+                    }
+                    else {    # peak overlapped with gene body
+                        $candidates{overlap}{ $gene{tid} } = \%gene;
+
+                        # check binding type
+                        if ( $tss < $peakStart ) {    # TSS not included
+                                                      # distance to TSS
+                            $candidates{overlap}{$tid}{distance} =
+                              $peakStart - $tss;
+
+                            # determine binding type
+                            if ( $tes <= $peakEnd ) {    # TES
+                                $candidates{overlap}{$tid}{type} =
+                                  $bindingTypes{TES};
+                            }
+                            else {    # 5' UTR, exonic, intronic or 3' UTR
+                                @exons = @{ $gene{exons} };
+                                for (@exons) {    # check exons
+                                    my ( $s, $e ) = @$_;
+                                    next if $e < $peakStart;
+                                    last if $s > $peakEnd;
+                                    @sorted = sort { $a <=> $b } $peakStart,
+                                      $peakEnd, $s, $e;
+                                    $overlapLength = $sorted[2] - $sorted[1];
+                                    $regionLength  = $e - $s + 1;
+                                    $ratio =
+                                        $regionLength < $peakLength
+                                      ? $overlapLength / $regionLength
+                                      : $overlapLength / $peakLength;
+                                    if ( $ratio >= $ratioCutoff ) {
+
+                                        # peak is annotated to an exon, check
+                                        # whether this exon is in UTR region
+                                        if ( $gene{coding} ) {
+                                            $cds = $gene{cds};
+                                            if ( $cds > $peakStart ) {  # 5' UTR
+                                                @sorted =
+                                                  sort { $a <=> $b } $peakStart,
+                                                  $peakEnd, $cds, $tss;
+                                                $overlapLength =
+                                                  $sorted[2] - $sorted[1];
+                                                $regionLength = $cds - $tss + 1;
+                                                $ratio =
+                                                    $regionLength < $peakLength
+                                                  ? $overlapLength /
+                                                  $regionLength
+                                                  : $overlapLength /
+                                                  $peakLength;
+                                                if ( $ratio >= $ratioCutoff ) {
+                                                    $candidates{overlap}{$tid}{type} =
+                                                      $bindingTypes{UTR5};
+                                                    last;
+                                                }
+                                            }
+                                            $cde = $gene{cde};
+                                            if ( $cde < $peakEnd ) {    # 3' UTR
+                                                @sorted =
+                                                  sort { $a <=> $b } $peakStart,
+                                                  $peakEnd, $cde, $tes;
+                                                $overlapLength =
+                                                  $sorted[2] - $sorted[1];
+                                                $regionLength = $tes - $cde + 1;
+                                                $ratio =
+                                                    $regionLength < $peakLength
+                                                  ? $overlapLength /
+                                                  $regionLength
+                                                  : $overlapLength /
+                                                  $peakLength;
+                                                if ( $ratio >= $ratioCutoff ) {
+                                                    $candidates{overlap}{$tid}{type} =
+                                                      $bindingTypes{UTR3};
+                                                    last;
+                                                }
+                                            }
+                                        }
+
+                                        # if not annotated, annotate as Exonic
+                                        $candidates{overlap}{$tid}{type} =
+                                          $bindingTypes{Exonic};
+                                        last;
+                                    }
+                                }
+
+                                # check next gene if type is determined
+                                next if exists $candidates{overlap}{$tid}{type};
+
+                                # peak overlap with gene body, and it is not in
+                                # exonic regions, then it must be in intronic
+                                $candidates{overlap}{$tid}{type} =
+                                  $bindingTypes{Intronic};
+                            }
+                        }
+                        else {    # TSS included, treat as TSS
+                            $candidates{overlap}{$tid}{type} =
+                              $bindingTypes{TSS};
+                            $candidates{overlap}{$tid}{distance} = 0;
+                        }
+                    }
+                }
+                else {            # gene is on '-' strand
+                    if ( $tss < $peakStart ) {    # check whether is promoter
+                        @sorted = sort { $a <=> $b } $peakStart,
+                          $peakEnd, $gene{right}, $tss;
+                        $overlapLength = $sorted[2] - $sorted[1];
+                        $regionLength  = $gene{right} - $tss + 1;
+                        $ratio =
+                            $regionLength < $peakLength
+                          ? $overlapLength / $regionLength
+                          : $overlapLength / $peakLength;
+                        if ( $ratio >= $ratioCutoff ) {
+                            $candidates{left}{$tid} = \%gene;
+                            $candidates{left}{$tid}{type} =
+                              $bindingTypes{Promoter};
+
+                            # distance to TSS
+                            $candidates{left}{$tid}{distance} =
+                              $peakStart - $tss;
+                        }
+                    }
+                    elsif ( $tes > $peakEnd ) {    # can only be downstream
+                        @sorted = sort { $a <=> $b } $peakStart,
+                          $peakEnd, $gene{left}, $tes;
+                        $overlapLength = $sorted[2] - $sorted[1];
+                        $regionLength  = $tes - $gene{left} + 1;
+                        $ratio =
+                            $regionLength < $peakLength
+                          ? $overlapLength / $regionLength
+                          : $overlapLength / $peakLength;
+                        if ( $ratio >= $ratioCutoff ) {
+                            $candidates{right}{$tid} = \%gene;
+                            $candidates{right}{$tid}{type} =
+                              $bindingTypes{Downstream};
+
+                            # distance to TSS
+                            $candidates{right}{$tid}{distance} =
+                              $tss - $peakEnd;
+                        }
+                    }
+                    else {    # peak overlapped with gene body
+                        $candidates{overlap}{ $gene{tid} } = \%gene;
+
+                        # check binding type
+                        if ( $tss > $peakEnd ) {    # TSS not included
+                                                    # distance to TSS
+                            $candidates{overlap}{$tid}{distance} =
+                              $tss - $peakEnd;
+
+                            # determine binding type
+                            if ( $tes >= $peakStart ) {    # TES
+                                $candidates{overlap}{$tid}{type} =
+                                  $bindingTypes{TES};
+                            }
+                            else {    # 5' UTR, exonic, intronic or 3' UTR
+                                @exons = @{ $gene{exons} };
+                                for (@exons) {    # check exons
+                                    my ( $s, $e ) = @$_;
+                                    next if $e < $peakStart;
+                                    last if $s > $peakEnd;
+                                    @sorted = sort { $a <=> $b } $peakStart,
+                                      $peakEnd, $s, $e;
+                                    $overlapLength = $sorted[2] - $sorted[1];
+                                    $regionLength  = $e - $s + 1;
+                                    $ratio =
+                                        $regionLength < $peakLength
+                                      ? $overlapLength / $regionLength
+                                      : $overlapLength / $peakLength;
+                                    if ( $ratio >= $ratioCutoff ) {
+
+                                        # peak is annotated to an exon, check
+                                        # whether this exon is in UTR region
+                                        if ( $gene{coding} ) {
+                                            $cds = $gene{cds};
+                                            unless ( $cds > $peakEnd ) {  # 5' UTR
+                                                @sorted =
+                                                  sort { $a <=> $b } $peakStart,
+                                                  $peakEnd, $cds, $tss;
+                                                $overlapLength =
+                                                  $sorted[2] - $sorted[1];
+                                                $regionLength = $tss - $cds + 1;
+                                                $ratio =
+                                                    $regionLength < $peakLength
+                                                  ? $overlapLength /
+                                                  $regionLength
+                                                  : $overlapLength /
+                                                  $peakLength;
+                                                if ( $ratio >= $ratioCutoff ) {
+                                                    $candidates{overlap}{$tid}{type} =
+                                                      $bindingTypes{UTR5};
+                                                    last;
+                                                }
+                                            }
+                                            $cde = $gene{cde};
+                                            unless ( $cde < $peakStart ) {    # 3' UTR
+                                                @sorted =
+                                                  sort { $a <=> $b } $peakStart,
+                                                  $peakEnd, $cde, $tes;
+                                                $overlapLength =
+                                                  $sorted[2] - $sorted[1];
+                                                $regionLength = $cde - $tes + 1;
+                                                $ratio =
+                                                    $regionLength < $peakLength
+                                                  ? $overlapLength /
+                                                  $regionLength
+                                                  : $overlapLength /
+                                                  $peakLength;
+                                                if ( $ratio >= $ratioCutoff ) {
+                                                    $candidates{overlap}{$tid}{type} =
+                                                      $bindingTypes{UTR3};
+                                                    last;
+                                                }
+                                            }
+                                        }
+
+                                        # if not annotated, annotate as Exonic
+                                        $candidates{overlap}{$tid}{type} =
+                                          $bindingTypes{Exonic};
+                                        last;
+                                    }
+                                }
+
+                                # check next gene if type is determined
+                                next if exists $candidates{overlap}{$tid}{type};
+
+                                # peak overlap with gene body, and it is not in
+                                # exonic regions, then it must be in intronic
+                                $candidates{overlap}{$tid}{type} =
+                                  $bindingTypes{Intronic};
+                            }
+                        }
+                        else {    # TSS included, treat as TSS
+                            $candidates{overlap}{$tid}{type} =
+                              $bindingTypes{TSS};
+                            $candidates{overlap}{$tid}{distance} = 0;
+                        }
+                    }
+                }
+            }
+            unshift @genes, @store;
+            my ( %boundGenes, $gene, $tid, %gene );
+            if (%candidates) {
+                if ( exists $candidates{overlap} ) {
+                    my $minScore = 10;
+                    while ( my ( $id, $ref ) = each %{ $candidates{overlap} } )
+                    {
+                        %gene = %$ref;
+                        $gene = $gene{gene};
+                        if ( exists $boundGenes{$gene} ) {
+
+                            # for the same gene, using smallest bindingTypes to
+                            # determine both type and distance
+                            if ( $gene{type} < $boundGenes{$gene}{type} )
+                            {
+                                $boundGenes{$gene}{distance} = $gene{distance};
+                                $boundGenes{$gene}{type}     = $gene{type};
+                                if ($minScore > $gene{type}) {
+                                    $minScore = $gene{type};
+                                }
+                            }
+                        }
+                        else {
+                            $boundGenes{$gene}{type}     = $gene{type};
+                            $boundGenes{$gene}{distance} = $gene{distance};
+                            $boundGenes{$gene}{strand}   = $gene{strand};
+                            if ($minScore > $gene{type}) {
+                                $minScore = $gene{type};
+                            }
+                        }
+                    }
+                    # delete Intronic genes if any other type mapped
+                    if ($minScore < $bindingTypes{Intronic}) { # 6 is Intronic
+                        while (my ($id, $ref) = each %boundGenes) {
+                            delete $boundGenes{$id} 
+                                if $boundGenes{$id}{type} == $bindingTypes{Intronic};
+                        }
+                    }
+                    if ( exists $candidates{left} ) {
+
+                        # only consider nearest gene on the left side
+                        my ( $distance, $failed, $type, $strand );
+                        while ( my ( $id, $ref ) = each %{ $candidates{left} } )
+                        {
+                            if ($distance) {
+                                if ( $distance > $ref->{distance} ) {
+                                    $distance = $ref->{distance};
+                                    $gene     = $ref->{gene};
+                                    $tid      = $ref->{tid};
+                                    $type     = $ref->{type};
+                                    $strand   = $ref->{strand};
+                                }
+                            }
+                            else {
+                                $distance = $ref->{distance};
+                                $gene     = $ref->{gene};
+                                $tid      = $ref->{tid};
+                                $type     = $ref->{type};
+                                $strand   = $ref->{strand};
+                            }
+                        }
+                        unless ( exists $boundGenes{$gene} ) {
+
+                            # get right most site of this candidate gene
+                            # here filter this gene if it is on the left side
+                            # of left-partial-overlapped gene
+                            my $right =
+                                $strand eq '+'
+                              ? $candidates{left}{$tid}{tes}
+                              : $candidates{left}{$tid}{tss};
+                            while ( my ( $id, $ref ) =
+                                each %{ $candidates{overlap} } )
+                            {
+                                if (    $ref->{strand} eq '+'
+                                    and $ref->{distance}
+                                    and $ref->{tss} > $right )
+                                {
+                                    $failed = 1;
+                                    last;
+                                }
+                                elsif ( $ref->{strand} eq '-'
+                                    and $ref->{tes} < $peakStart
+                                    and $ref->{tes} > $right )
+                                {
+                                    $failed = 1;
+                                    last;
+                                }
+                            }
+                            unless ($failed) {
+                                $boundGenes{$gene}{distance} = $distance;
+                                $boundGenes{$gene}{type}     = $type;
+                                $boundGenes{$gene}{strand}   = $strand;
+                            }
+                        }
+                    }
+                    if ( exists $candidates{right} ) {
+
+                        # only consider nearest gene on the right side
+                        my ( $distance, $failed, $type, $strand );
+                        while ( my ( $id, $ref ) =
+                            each %{ $candidates{right} } )
+                        {
+                            if ($distance) {
+                                if ( $distance > $ref->{distance} ) {
+                                    $distance = $ref->{distance};
+                                    $gene     = $ref->{gene};
+                                    $tid      = $ref->{tid};
+                                    $type     = $ref->{type};
+                                    $strand   = $ref->{strand};
+                                }
+                            }
+                            else {
+                                $distance = $ref->{distance};
+                                $gene     = $ref->{gene};
+                                $tid      = $ref->{tid};
+                                $type     = $ref->{type};
+                                $strand   = $ref->{strand};
+                            }
+                        }
+                        unless ( exists $boundGenes{$gene} ) {
+
+                            # get left most site of this candidate gene
+                            # here filter this gene if it is on the right side
+                            # of right-partial-overlapped gene
+                            my $left =
+                                $strand eq '+'
+                              ? $candidates{right}{$tid}{tss}
+                              : $candidates{right}{$tid}{tes};
+                            while ( my ( $tid, $ref ) =
+                                each %{ $candidates{overlap} } )
+                            {
+                                if (    $ref->{strand} eq '-'
+                                    and $ref->{distance}
+                                    and $ref->{tss} < $left )
+                                {
+                                    $failed = 1;
+                                    last;
+                                }
+                                elsif ( $ref->{strand} eq '+'
+                                    and $ref->{tss} < $left
+                                    and $ref->{tss} > $peakEnd )
+                                {
+                                    $failed = 1;
+                                    last;
+                                }
+                            }
+                            unless ($failed) {
+                                $boundGenes{$gene}{distance} = $distance;
+                                $boundGenes{$gene}{type}     = $type;
+                                $boundGenes{$gene}{strand}   = $strand;
+                            }
+                        }
+                    }
+                }
+                else {
+                    # no overlapped genes, merge left and right and find the
+                    # best one, that means, for the same type, choose nearest
+                    my @merged;
+                    my ( $type, $distance, $strand ) = (10);
+                    if ( exists $candidates{left} ) {
+                        @merged = values %{ $candidates{left} };
+                    }
+                    if ( exists $candidates{right} ) {
+                        push @merged, values %{ $candidates{right} };
+                    }
+                    for (@merged) {
+                        if ( $type > $_->{type} ) {
+                            $distance = $_->{distance};
+                            $gene     = $_->{gene};
+                            $type     = $_->{type};
+                            $strand   = $_->{strand};
+                        }
+                        elsif ( $type == $_->{type} ) {
+                            if ( $distance > $_->{distance} ) {
+                                $distance = $_->{distance};
+                                $gene     = $_->{gene};
+                                $type     = $_->{type};
+                                $strand   = $_->{strand};
+                            }
+                        }
+                    }
+                    $boundGenes{$gene}{distance} = $distance;
+                    $boundGenes{$gene}{type}     = $type;
+                    $boundGenes{$gene}{strand}   = $strand;
+                }
+
+                # output boundGenes
+                my $minScore = 10;
+                while ( my ( $gene, $ref ) = each %boundGenes ) {
+                    print {$to} join( "\t",
+                        $chr,       $peakStart,
+                        $peakEnd,   $peakName,
+                        $peakScore, $bindingTypes[ $ref->{type} ],
+                        $gene,      $ref->{distance},
+                        $ref->{strand} ),
+                      "\n";
+                    $minScore = $bindingTypes{ $bindingTypes[ $ref->{type} ] } if
+                        $minScore > $bindingTypes{ $bindingTypes[ $ref->{type} ] };
+                }
+                $summary{$minScore}++;
+            }
+            else {    # intergenic
+                print {$intergenic} join( "\t",
+                    $chr, $peakStart, $peakEnd, $peakName, $peakScore ),
+                  "\n";
+                $summary{$bindingTypes{Intergenic}}++;
+            }
+        }
+    }
+    close $intergenic
+      or warn "$0 : failed to close output file '$intergenic_file_name' : $!\n";
+
+    close $to
+      or warn "$0 : failed to close output file '$to_file_name' : $!\n";
+    print "Peak annotate summary:\n";
+    for (0 .. $#bindingTypes) {
+        my $num = $summary{$_} || 0;
+        print "$bindingTypes[$_]\t$num\n";
+    }
+}
+
+__END__
+
+peakAnnotate    Annotate the peaks to the target genes.
+                peakAnnotate can typically map each peak from MACS or other
+                peak calling programs to the known gene annotation file and
+                determine the binding location.
+                Peaks are mapped to gene lications according this priority:
+                    TSS, Promoter, TES, UTR5, Exonic, Intronic, UTR3, 
+                    Downstream
+                Details can be seen in the end of this documentation.
+                Note that each peak may mapped to multiple genes, but only 
+                one binding type for each gene.
+
+Options:
+
+-peak, -p
+        Peak file name, it must be in BED format. NEEDED.
+
+-gene, -g
+        Gene annotation file name, it can be in BED12 or GTF format. NEEDED.
+
+-output, -o
+        Output file name. The output format can be seen afterward. NEEDED.
+
+-upstream, -u
+        Extended upstream from the TSS site. It can be treated as promoter
+        region in some cases, it is different from -tss, although may part
+        overlap with it. Default is 2,000 bp.
+
+-downstream, -d
+        Extended downstream from the TES (transcription end site). Default
+        is 0 bp.
+
+-ratio, -r
+        The minimal overlapped ratio of the peak or the particular region to
+        determine if this peak is binding to the location. The bigger this 
+        value is, it will be harder to determine a particular binding type, 
+        so it's more easier to get the 'Exonic' type. Default is 0.5.
+
+-help, -h
+        Display this information and exit.
+
+
+Output file format:
+    Output file will contain 8 columns for gene binding peaks and 6 columns
+    for intergenic peaks. They are:
+
+    chr             Chromosome ID, first column of peak BED file.
+    peak_start      Peak start site, second column of peak BED file.
+    peak_end        Peak end site, third column of peak BED file.
+    peak_ID         Peak name, forth column of peak BED file.
+    peak_score      Peak score, fifth column of peak BED file.
+    bindingType     Binding type, details can be seen in the end.
+    gene_name       'gene_name' value in gene GTF file. If not exists in GTF 
+                    file,  it will be 'gene_id'. It's always '-' for BED format
+                    gene annotation file.
+    strand          Strand information for this gene.
+
+
+Binding types:
+    They are 8 kinds of binding types from the highest priority to lowerest:
+        TSS, Promoter, TES, UTR5, Exonic, Intronic, UTR3, Downstream
+
+    TSS         If TSS site is overlapped with the peak, this binding type 
+                be determined as TSS. Note this peak may map to whole gene
+                body or the Promoter region.
+
+    Promoter    If TSS site is not included in the peak, but the overlapped
+                fraction between peak and TSS to upstream region is bigger
+                than -ratio, it will be determined as Promoter.
+
+    TES         If TSS is not included but TES is included in the peak, it
+                will be determined as TES. Note this peak may map to Exonic
+                or Intronic region.
+
+    UTR5        If the overlapped fraction between the 5'-UTR region and this 
+                peak is bigger than the -ratio of either the 5'-UTR region or
+                the peak length. This is only for protein-coding genes.
+
+    UTR3        If the overlapped fraction between the 3'-UTR region and this 
+                peak is bigger than the -ratio of either the 3'-UTR region or
+                the peak length. This is only for protein-coding genes.
+
+    Exonic      If the overlapped fraction between any exonic region and this 
+                peak is bigger than the -ratio of either this exon length or
+                the peak length.
+
+    Intronic    If the overlapped fraction between any intronic region and this 
+                peak is bigger than the -ratio of either this intron length or
+                the peak length.
+
+    Downstream  If the overlapped fraction between the downstream region and 
+                this peak is bigger than the -ratio of either this downstream
+                region or the peak length.
+
+    Peaks can't determined as any one of these binding types will be treated
+    as Intergenic and will not be outputed.
+
+BUG report:
+                Zhijun HAN <hangeneral@126.com>, 10/29/2013
+

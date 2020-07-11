@@ -1,0 +1,1006 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use Getopt::Long;
+use List::Util 'max';
+
+# set default values
+my %opts = (
+    'tssup'      => 1000,
+    'tssdown'    => 1000,
+    'tssbins'    => 100,
+    'upstream'   => 2000,
+    'upbins'     => 20,
+    'downstream' => 1000,
+    'downbins'   => 10,
+    'genebins'   => 70,
+    'regionbins' => 100,
+
+    # option for processing reads in BED file
+    'extendto' => 200,
+    'dup'      => 0,     # default, keep all reads
+);
+
+GetOptions(
+    \%opts,
+    'geneList|l=s',      # optional
+    'reads|rd=s',  'output|o=s',    # needed options
+    'region|rg=s', 'gtf|g=s',       # at least one
+    'regionbins|rb=i',              # region bins
+    'position|p', 
+    'tss', 'tssup|tu=i', 'tssdown|td=i', 'tssbins|tb=i',    # TSS only
+    'upstream|u|us=i',   'upbins|ub=i',                     # promoter region
+    'downstream|d|ds=i', 'downbins|db=i',                   # TES downstream
+    'genebins|gb=i',      # gene body region bins
+    'transcript|t',       # if set, distinguish each transcript in the same gene
+    'genome|n=s',         # genome version
+    'extendto|e=i',
+    'dup=i',
+    'genomenorm|on=i',    # if given, do genome-wide nomalization to this scale
+    'genenorm|en=i',      # if given, do gene-wide nomalization to this scale
+    'help|h',
+);
+
+die <DATA> if $opts{help};
+
+die "-reads and -output are needed.\n" unless $opts{reads} and $opts{output};
+die "At least one of -gtf and -region is needed.\n"
+  unless $opts{gtf}
+  or $opts{region};
+die "You can only set one of -gtf or -region.\n"
+  if $opts{gtf} and $opts{region};
+die "-genome is needed.\n" if $opts{gtf} and not $opts{genome};
+
+my %geneList;
+
+# 1. read in the specified genes
+# if gene list file is given, read in these genes and only generate profiles on
+# these part of genes, otherwise, set gene lists to all genes (or transcripts,
+# based on whether -transcript is set on or not) found in the GTF file.
+print "Read in given gene list.\n" if $opts{geneList};
+_get_gene_list() if $opts{geneList};
+
+# 2. read in chromSizes file if need
+my ( $chrSizeFile, %chromSizes );
+print "Search and read in chromSizes file.\n" if $opts{gtf};
+_read_chromSize_file() if $opts{gtf};
+
+# 3. read in gene annotation file in GTF/BED format or regions from BED format
+# it's a little complicated in read in gene annotation file, because I need to
+# check whether -geneList is given or not, then check whether -tss is set on or
+# not, if set on, only record TSS, else, record both TSS and TES.
+my %gene2trans;
+my %transAnno;
+my %geneBins;
+my $totalBins;
+if ( $opts{gtf} ) {    # regions are sepcified by genes
+    print "Load in gene annotation file.\n";
+    _read_gene_annotation_file_for_transcript();
+    _merge_trans_for_gene() unless $opts{transcript};
+
+    # 4. prepare bins for each gene
+    # when prepare bins for genebody, check whether -upstream and -downstream
+    # are set or not.
+    if ( $opts{tss} ) {
+        print "Prepare bins for each TSS.\n";
+        _prepare_bins_for_tss();
+    }
+    else {
+        print "Prepare bins for each gene body.\n";
+        _prepare_bins_for_genebody();
+    }
+}
+else {    # regions are specified by file
+    print "Load in regions and prepare bins for each region.\n";
+    _prepare_bins_for_region();
+}
+
+# 5. read in reads file and make profiles
+# I need to check whether reads file is in BED format or in bedGraph format, if
+# in BED format, first extend each read and then remove duplicated reads, then
+# turn into bedGraph format and normalize by total reads number
+print "Read in reads file and make profiles, this may take minutes...\n";
+my $position = $opts{position} || 0;
+_read_reads_file_and_make_profiles();
+
+# 6. normalize if needed
+print "Normalize by genome wide maximum score.\n" if $opts{genomenorm};
+_normalize_by_genome_maximum_score()              if $opts{genomenorm};
+print "Normalize by gene wide maximum score.\n"   if $opts{genenorm};
+_normalize_by_gene_maximum_score()                if $opts{genenorm};
+
+sub _normalize_by_genome_maximum_score {
+    my $input = $opts{output};
+    my $max = $opts{genomenorm};
+    (my $output = $input) =~ s/(\w+)$/genomenormed.$1/; 
+    my %count;
+    open my $in, '<', $input or die "Can't open file $input. $!\n";
+    my $head = <$in>;
+    my ($chr, $start, $end, $gene, @scores);
+    if ($position) {
+        while (<$in>) {
+            chomp;
+            ($chr, $start, $end, $gene, @scores) = split /\t/;
+            $count{int($_)}++ for @scores;
+        }
+    }
+    else {
+        while (<$in>) {
+            chomp;
+            ($gene, @scores) = split /\t/;
+            $count{int($_)}++ for @scores;
+        }
+    }
+    my $totalLines = $. - 1;
+    close $in;
+    my @sortedKeys = sort {$b <=> $a} keys %count;
+    my $number = 0;
+    my $cutoffNumber = $totalLines * @scores * 0.01; # use 99% as maximal value
+    my $cutoffValue;
+    for (@sortedKeys) {
+        $number += $count{$_};
+        if ($number >= $cutoffNumber) {
+            $cutoffValue = $_;
+            last;
+        }
+    }
+    open    $in, '<', $input or die "Can't open file $input. $!\n";
+    open my $to, '>', $output or die "Can't create file $output. $!\n";
+    $head = <$in>;
+    print {$to} $head;
+    $cutoffValue /= $max;
+    if ($position) {
+        while (<$in>) {
+            chomp;
+            ($chr, $start, $end, $gene, @scores) = split /\t/;
+            print {$to} join("\t", $chr, $start, $end, $gene, 
+                map {sprintf("%.2f", 
+                    $_ / $cutoffValue  > $max ? $max : $_ / $cutoffValue)
+                } @scores
+            ), "\n";
+        }
+    }
+    else {
+        while (<$in>) {
+            chomp;
+            ($gene, @scores) = split /\t/;
+            print {$to} join("\t", $gene, 
+                map {sprintf("%.2f", 
+                    $_ / $cutoffValue  > $max ? $max : $_ / $cutoffValue)
+                } @scores
+            ), "\n";
+        }
+    }
+    close $in;
+    close $to;
+}
+
+sub _normalize_by_gene_maximum_score {
+    my $scale = $opts{genenorm};
+    ( my $normed = $opts{output} ) =~ s/(\w+)$/genenormed.$1/;
+    open my $in, '<', $opts{output} or die "Can't open file '$opts{output}'.\n";
+    my $head = <$in>;
+    open my $to, '>', $normed or die "Can't open file '$normed'.\n";
+    print {$to} $head;
+    if ($position) {
+        while (<$in>) {
+            chomp;
+            my ( $chr, $start, $end, $gene, @t ) = split /\t/;
+            my $max = max(@t) / $scale;
+            @t = map { $_ / $max } @t if $max;
+            print {$to} join( "\t", $gene, map {sprintf("%.2f", $_)} @t ), "\n";
+        }
+    }
+    else {
+        while (<$in>) {
+            chomp;
+            my ( $gene, @t ) = split /\t/;
+            my $max = max(@t) / $scale;
+            @t = map { $_ / $max } @t if $max;
+            print {$to} join( "\t", $gene, map {sprintf("%.2f", $_)} @t ), "\n";
+        }
+    }
+    close $in;
+    close $to;
+}
+
+sub _read_reads_file_and_make_profiles {
+    my $freads = $opts{reads};
+    if ( $freads =~ /bed$/i ) {    # BED format, turn into bedGraph
+        print "Reads file is in BED format, turn into bedGraph format now.\n";
+        my $length = _get_reads_length($freads);
+        print "Detected reads length is ${length}bp.\n";
+        my $totalReads;
+        if ( $opts{extendto} - $length ) {
+            ( my $tmp = $freads ) =~ s/bed$/$opts{extendto}bp.bed/i;
+            print "Extend each read to $opts{extendto}bp.\n";
+            $totalReads =
+              _extend_reads( $freads, $tmp, $opts{extendto} - $length );
+            $freads = $tmp;
+        }
+        _check_sort($freads);    # if not sorted, sort and replace original file
+        if ( $opts{dup} ) {
+            ( my $tmp = $freads ) =~ s/bed$/dup$opts{dup}.bed/i;
+            my $kept;
+            print "Remove duplicated reads with duplicated level $opts{dup}.\n";
+            ( $totalReads, $kept ) =
+              _remove_dup_reads( $freads, $tmp, $opts{dup} );
+            print "Totally $kept of $totalReads reads kept.\n";
+            $totalReads = $kept;
+            unlink $freads if $freads =~ /$opts{extendto}bp.bed$/;
+            $freads = $tmp;
+        }
+        ( my $tmp = $freads ) =~ s/bed$/bg/i;
+        print "Turn BED reads into bedGraph and normalize by total reads.\n";
+        _turn_bed_into_bedGraph_and_normalize( $freads, $tmp, $totalReads );
+        unlink $freads
+          if $freads =~ /$opts{extendto}bp.bed$/
+          or $freads =~ /dup$opts{dup}.bed$/;
+        $freads = $tmp;
+    }
+    open my $to, '>', $opts{output} or die "Can't open file '$opts{output}'.\n";
+    if ($position) {
+        print {$to} join( "\t", 'chr', 'start', 'end', 'gene_name',
+            1 .. $totalBins ), "\n";
+    }
+    else {
+        print {$to} join( "\t", 'gene_name', 1 .. $totalBins ), "\n";
+    }
+    open my $in, '<', $freads or die "Can't open reads file '$freads'.\n";
+    while (<$in>) {    # initialize a new chr
+        last unless $_;
+        my @r   = split;
+        my $chr = $r[0];
+        unless ( exists $geneBins{$chr} ) {    # no regions on this chr
+            while (<$in>) {                    # read to next chr
+                @r = split;
+                last if $r[0] ne $chr;
+            }
+            last unless $_;                    # eof
+            redo;    # new chr has already been read in
+        }
+        my @genes = sort { $a->[1][0] <=> $b->[1][0] }
+          map { [ $_, @{ $geneBins{$chr}{$_} } ] }
+          keys %{ $geneBins{$chr} };
+        delete $geneBins{$chr};
+        my @store = ( [ @r[ 1, 2, 3 ] ] );
+        my $newChr;    # flag for new chr
+        for my $g (@genes) {
+            my ( $id, @bins ) = @$g;
+            my $strand = $transAnno{$id}{strand};
+            my $name = $transAnno{$id}{name};    # get the gene name
+            my $start = $transAnno{$id}{start};  # get region start
+            my $end = $transAnno{$id}{end};  # get region end
+            my ( $geneStart, $geneEnd ) = ( $bins[0][0], $bins[-1][1] );
+            if (@store) {    # @store maybe empty when $newChr is True
+                if ( $store[-1][1] < $geneStart ) { @store = (); }
+            }
+            unless ($newChr) {    # new chr? don't read anymore
+                while ( $r[2] < $geneEnd ) {    # read to end of this gene
+                    $_ = <$in>;
+                    unless ($_) {               # eof
+                        $newChr = 1;
+                        last;
+                    }
+                    @r = split;
+                    if ( $r[0] ne $chr ) {
+                        $newChr = 1;
+                        last;
+                    }
+                    push @store, [ @r[ 1 .. 3 ] ];
+                }
+            }
+            while (@store) {    # @store maybe empty when $newChr is True
+                $store[0][1] < $geneStart ? shift @store : last;
+            }
+            my ( $binStart, $binEnd, $binScore ) = ( @{ +shift @bins }, 0 );
+            my $binLength = $binEnd - $binStart + 1;
+            my @scores;
+            for my $s (@store) {    # calculate score for each bin
+                my ( $regionStart, $regionEnd, $regionScore ) = @$s;
+                if ( $regionStart > $binEnd ) {    # bin in on left
+                    push @scores, $binScore / $binLength;
+                    if (@bins) {                   # try next bin
+                        ( $binStart, $binEnd, $binScore ) =
+                          ( @{ +shift @bins }, 0 );
+                        $binLength = $binEnd - $binStart + 1;
+                        redo;
+                    }
+                    else {                         # finish
+                        last;
+                    }
+                }
+                elsif ( $regionEnd < $binStart ) {  # bin is on right, possible?
+                    next;                           # try next region
+                }
+                else {                              # overlapped
+                    my @sorted = sort { $a <=> $b } $binStart, $binEnd,
+                      $regionStart, $regionEnd;
+                    $binScore += ( $sorted[2] - $sorted[1] + 1 ) * $regionScore;
+                    if ( $binEnd > $regionEnd ) {    # bin extended out
+                        next;                        # try next region
+                    }
+                    else {    # bin is included in this region, try next bin
+                        push @scores, $binScore / $binLength;
+                        if (@bins) {    # try next bin
+                            ( $binStart, $binEnd, $binScore ) =
+                              ( @{ +shift @bins }, 0 );
+                            $binLength = $binEnd - $binStart + 1;
+                            redo;
+                        }
+                        else {          # finish
+                            last;
+                        }
+                    }
+                }
+            }
+            if ( @scores < $totalBins ) {    # append 0 to required length
+                push @scores, $binScore / $binLength;
+                push @scores, map { 0 } 1 .. $totalBins - @scores;
+            }
+            if ( $strand eq '+' ) {
+                if ($position) {
+                    print {$to}
+                      join( "\t", $chr, $start, $end, $name, 
+                          map { sprintf( "%.2f", $_ ) } @scores ), "\n";
+                }
+                else {
+                    print {$to}
+                      join( "\t", $name, 
+                          map { sprintf( "%.2f", $_ ) } @scores ), "\n";
+                }
+            }
+            else {
+                if ($position) {
+                    print {$to} join( "\t", $chr, $start, $end, 
+                        $name, map { sprintf( "%.2f", $_ ) } reverse @scores ),
+                      "\n";
+                }
+                else {
+                    print {$to} join( "\t",  
+                        $name, map { sprintf( "%.2f", $_ ) } reverse @scores ),
+                      "\n";
+                }
+            }
+        }
+        redo if $newChr;    # else, treat left lines as new chr
+    }
+    while ( my ( $chr, $ref ) = each %geneBins ) {
+        print "$chr is not found in reads file, profiles are set to zero for "
+          . "genes on this chromosome.\n";
+        if ($position) {
+            while ( my ( $gene, $binRef ) = each %$ref ) {
+                print {$to}
+                  join( "\t", $transAnno{$gene}{chr}, $transAnno{$gene}{start}, 
+                      $transAnno{$gene}{end}, $transAnno{$gene}{name}, 
+                      map { 0 } 1 .. $totalBins ), "\n";
+            }
+        }
+        else {
+            while ( my ( $gene, $binRef ) = each %$ref ) {
+                print {$to}
+                  join( "\t", $transAnno{$gene}{name}, 
+                      map { 0 } 1 .. $totalBins ), "\n";
+            }
+        }
+    }
+    close $in;
+    close $to;
+}
+
+sub _turn_bed_into_bedGraph_and_normalize {
+    my ( $input, $normalizedBg, $total ) = @_;
+    my $bg  = "$$.bg";
+    my $cmd = "bedtools genomecov -i $input -g $chrSizeFile -bg > $bg";
+    system($cmd) == 0 or die "Failed to convert '$input' to bedGraph!\n";
+    my $coef = 1e9 / $total / $opts{extendto};
+    my ($score);
+    open my $in, '<', $bg or die "Can't open input file '$bg'.\n";
+    open my $to, '>', $normalizedBg
+      or die "Can't open output file '$normalizedBg'.\n";
+
+    while (<$in>) {
+        my @t = split;
+        $score = $t[-1] * $coef;
+        print {$to} join( "\t", @t[ 0, 1, 2 ], $score ), "\n";
+    }
+    close $in;
+    close $to;
+    unlink $bg or print "Can't delete temporary file '$bg'!\n";
+}
+
+sub _remove_dup_reads {
+    my ( $input, $output, $duplication ) = @_;
+    my $in_file_name = $input;    # input file name
+    open my $in, '<', $in_file_name
+      or die "$0 : failed to open  input file '$in_file_name' : $!\n";
+    my $to_file_name = $output;    # output file name
+    open my $to, '>', $to_file_name
+      or die "$0 : failed to open  output file '$to_file_name' : $!\n";
+    my ( $pre_start, $count, $strand ) = (-1);
+    my $kept = 0;
+    while (<$in>) {
+        my @t = split /\t/;
+        if ( $t[1] == $pre_start ) {
+            if ( $count++ < $duplication ) {
+                $kept++;
+                print {$to} $_;
+            }
+        }
+        else {
+            $count     = 1;
+            $pre_start = $t[1];
+            $kept++;
+            print {$to} $_;
+        }
+    }
+    my $total = $.;
+    close $to
+      or warn "$0 : failed to close output file '$to_file_name' : $!\n";
+    close $in
+      or warn "$0 : failed to close input file '$in_file_name' : $!\n";
+    return $total, $kept;
+}
+
+sub _check_sort {
+    my ( %chrs, @pre_line );
+    open my $fin, '<', $_[0] or die "Can't open input bed file $_[0]. $!\n";
+    my $unsorted;
+    while (<$fin>) {
+        last if $. == 100;
+        chomp;
+        my @t = split /\t/;
+        if ( @t < 3 ) {
+            die "At least 3 items needed in line $.. Pleaase check it.\n";
+        }
+        if (@pre_line) {
+            if ( $t[0] eq $pre_line[0] ) {   # same chromosome, check start site
+                if ( $t[1] < $pre_line[1] ) {
+                    $unsorted = 1;           # unsorted bed file
+                    last;
+                }
+            }
+            else {    # new chromosome, check whether presented before
+                if ( exists $chrs{ $t[0] } ) {    # exists before, unsorted
+                    $unsorted = 1;                # unsorted bed file
+                    last;
+                }
+                $chrs{ $t[0] } = undef;           # add chromosome name
+            }
+        }
+        @pre_line = @t;
+    }
+    close $fin;
+    if ($unsorted) {
+        print "Sort BED file using bedSort.\n";
+        system("bedSort $_[0] $_[0]") == 0 or die "bedSort failed.\n";
+    }
+}
+
+sub _extend_reads {
+    my ( $input, $output, $length, $genome ) = @_;
+    my $total_tags;
+    my $in_file_name = $input;    # input file name
+    open my $in, '<', $in_file_name
+      or die "$0 : failed to open  input file '$in_file_name' : $!\n";
+    my $to_file_name = $output;    # output file name
+    open my $to, '>', $to_file_name
+      or die "$0 : failed to open  output file '$to_file_name' : $!\n";
+    while (<$in>) {
+        chomp;
+        my @t = split /\t/;
+        if ( $t[5] eq '+' ) {
+            $t[2] += $length;
+            $t[2] = $chromSizes{ $t[0] } if $t[2] > $chromSizes{ $t[0] };
+        }
+        else {
+            $t[1] -= $length;
+            $t[1] = 0 if $t[1] < 0;
+        }
+        print {$to} join( "\t", @t ), "\n";
+    }
+    $total_tags = $.;
+    close $to
+      or warn "$0 : failed to close output file '$to_file_name' : $!\n";
+    close $in
+      or warn "$0 : failed to close input file '$in_file_name' : $!\n";
+    return $total_tags;
+}
+
+sub _get_reads_length {
+    my $input = shift;
+    my %count;
+    open my $in, '<', $input or die "Can't open file '$input'.\n";
+    for ( 0 .. 99 ) {
+        my @t = split /\s+/, <$in>;
+        my $length = $t[2] - $t[1];
+        $count{$length}++;
+    }
+    close $in;
+    my @length = sort { $count{$b} <=> $count{$a} } keys %count;
+    return $length[0];
+}
+
+sub _prepare_bins_for_region {
+    open my $in, '<', $opts{region} or die "Can't open file $opts{region}.\n";
+    my $bins   = $opts{regionbins};
+    my ( $start, $end, $step, @bins );
+    while (<$in>) {
+        chomp;
+        my @t = split /\t/;
+        ( $start, $end ) = @t[ 1, 2 ];
+        $step = ( $end - $start ) / $bins;
+        @bins = map {
+            [ int( $start + $step * $_ ), int( $start + $step * ( $_ + 1 ) ) ]
+        } 0 .. $bins - 1;
+        $geneBins{ $t[0] }{ $. } = [@bins];
+        $transAnno{ $. }{strand} = '+';
+        $transAnno{ $. }{name}   = $t[3] ? $t[3] : $.;
+        $transAnno{ $. }{chr}    = $t[0];
+        $transAnno{ $. }{start}  = $t[1];
+        $transAnno{ $. }{end}    = $t[2];
+    }
+    close $in;
+    $totalBins = $bins;
+}
+
+sub _prepare_bins_for_tss {
+    my $bins    = $opts{tssbins};
+    my $tssup   = $opts{tssup};
+    my $tssdown = $opts{tssdown};
+    my ( $start, $end, $step, @bins );
+    if ($opts{transcript}) { # I didn't record tss for transcript
+        while ( my ( $tid, $info ) = each %transAnno ) {
+            my $chr = $info->{chr};
+            if ( $info->{strand} eq '+' ) {
+                ( $start, $end ) =
+                  ( $info->{start} - $tssup, $info->{start} + $tssdown );
+            }
+            else {
+                ( $start, $end ) =
+                  ( $info->{end} - $tssdown, $info->{end} + $tssup );
+            }
+            $start = 0                 if $start < 0;
+            $end   = $chromSizes{$chr} if $end > $chromSizes{$chr};
+            $step  = ( $end - $start ) / $bins;
+            @bins  = map {
+                [ int( $start + $step * $_ ), int( $start + $step * ( $_ + 1 ) ) ]
+            } 0 .. $bins - 1;
+            $geneBins{$chr}{$tid} = [@bins];
+            $info->{start} = $start;
+            $info->{end} = $end;
+        }
+    }
+    else { # for merged genes, direct use tss
+        while ( my ( $tid, $info ) = each %transAnno ) {
+            my $chr = $info->{chr};
+            if ( $info->{strand} eq '+' ) {
+                ( $start, $end ) =
+                  ( $info->{tss} - $tssup, $info->{tss} + $tssdown );
+            }
+            else {
+                ( $start, $end ) =
+                  ( $info->{tss} - $tssdown, $info->{tss} + $tssup );
+            }
+            $start = 0                 if $start < 0;
+            $end   = $chromSizes{$chr} if $end > $chromSizes{$chr};
+            $step  = ( $end - $start ) / $bins;
+            @bins  = map {
+                [ int( $start + $step * $_ ), int( $start + $step * ( $_ + 1 ) ) ]
+            } 0 .. $bins - 1;
+            $geneBins{$chr}{$tid} = [@bins];
+            $info->{start} = $start;
+            $info->{end} = $end;
+        }
+    }
+    $totalBins = $bins;
+}
+
+sub _prepare_bins_for_genebody {
+    my $genebins = $opts{genebins};
+    my $upbins   = $opts{upstream} ? $opts{upbins} : 0;
+    my $downbins = $opts{downstream} ? $opts{downbins} : 0;
+    $totalBins = $genebins + $upbins + $downbins;
+    while ( my ( $tid, $ref ) = each %transAnno ) {
+        my ( $start, $end, $step, @bins );
+        my $chr = $ref->{chr};
+        if ( $ref->{strand} eq '+' ) {
+            if ( $opts{upstream} ) {
+                ( $start, $end ) =
+                  ( $ref->{start} - $opts{upstream}, $ref->{start} );
+                $start = 0 if $start < 0;
+                $step = ( $end - $start ) / $upbins;
+                push @bins, map {
+                    [
+                        int( $start + $step * $_ ),
+                        int( $start + $step * ( $_ + 1 ) )
+                    ]
+                } 0 .. $upbins - 1;
+            }
+            ( $start, $end ) = ( $ref->{start}, $ref->{end} ); # gene body
+            $step = ( $end - $start ) / $genebins;
+            push @bins, map {
+                [ int( $start + $step * $_ ), int( $start + $step * ( $_ + 1 ) ) ]
+            } 0 .. $genebins - 1;
+            if ( $opts{downstream} ) {
+                ( $start, $end ) =
+                  ( $ref->{end}, $ref->{end} + $opts{downstream} );
+                $end = $chromSizes{$chr} if $end > $chromSizes{$chr};
+                $step = ( $end - $start ) / $downbins;
+                push @bins, map {
+                    [
+                        int( $start + $step * $_ ),
+                        int( $start + $step * ( $_ + 1 ) )
+                    ]
+                } 0 .. $downbins - 1;
+            }
+            $ref->{start} -= $opts{upstream};
+            $ref->{end}   += $opts{downstream};
+        }
+        else { # -
+            if ( $opts{downstream} ) {
+                ( $start, $end ) =
+                  ( $ref->{start} - $opts{downstream}, $ref->{start} );
+                $end = $chromSizes{$chr} if $end > $chromSizes{$chr};
+                $step = ( $end - $start ) / $downbins;
+                push @bins, map {
+                    [
+                        int( $start + $step * $_ ),
+                        int( $start + $step * ( $_ + 1 ) )
+                    ]
+                } 0 .. $downbins - 1;
+            }
+            ( $start, $end ) = ( $ref->{start}, $ref->{end} ); # gene body
+            $step = ( $end - $start ) / $genebins;
+            push @bins, map {
+                [ int( $start + $step * $_ ), int( $start + $step * ( $_ + 1 ) ) ]
+            } 0 .. $genebins - 1;
+            if ( $opts{upstream} ) {
+                ( $start, $end ) =
+                  ( $ref->{end}, $ref->{end} + $opts{upstream} );
+                $start = 0 if $start < 0;
+                $step = ( $end - $start ) / $upbins;
+                push @bins, map {
+                    [
+                        int( $start + $step * $_ ),
+                        int( $start + $step * ( $_ + 1 ) )
+                    ]
+                } 0 .. $upbins - 1;
+            }
+            $ref->{start} -= $opts{downstream};
+            $ref->{end}   += $opts{upstream};
+        }
+        $geneBins{$chr}{$tid} = [@bins];
+    }
+}
+
+sub _read_chromSize_file {
+    die "-genome must be set for searching chromSizes file!\n"
+      unless $opts{genome};
+    my $genome = $opts{genome};
+    if ( exists $ENV{$genome} and -e "$ENV{$genome}/$genome.chromSizes" ) {
+        $chrSizeFile = "$ENV{$genome}/$genome.chromSizes";
+    }
+    elsif ( -e "$ENV{BOWTIE_INDEXES}/$genome.chromSizes" ) {
+        $chrSizeFile = "$ENV{BOWTIE_INDEXES}/$genome.chromSizes";
+    }
+    else {
+        system("fetchChromSizes $genome > $genome.chromSizes") == 0
+          or die "Failed to search $genome.chromSizes and fetchChromSizes "
+          . "also failed.\n";
+        $chrSizeFile = "$genome.chromSizes";
+    }
+    my $in_file_name = $chrSizeFile;    # output file name
+    open my $in, '<', $in_file_name
+      or die "$0 : failed to open  output file '$in_file_name' : $!\n";
+
+    while (<$in>) {
+        my ( $chr, $size ) = split;
+        $chromSizes{$chr} = $size;
+    }
+
+    close $in
+      or warn "$0 : failed to close output file '$in_file_name' : $!\n";
+}
+
+sub _merge_trans_for_gene {
+    my %geneAnno;
+    my $id = 0;
+    if ( $opts{tss} ) {    # merge for TSS
+        while ( my ( $gene, $ref ) = each %gene2trans ) {
+            my %trans;
+            for ( keys %$ref ) {
+                if ( $transAnno{$_}{strand} eq '+' ) {
+                    $trans{ $transAnno{$_}{chr} }{ $transAnno{$_}{strand} }
+                      { $transAnno{$_}{start} } = undef;
+                }
+                else {
+                    $trans{ $transAnno{$_}{chr} }{ $transAnno{$_}{strand} }
+                      { $transAnno{$_}{end} } = undef;
+                }
+            }
+            for my $chr ( keys %trans ) {    # transcripts may on different chrs
+                for my $strand ( keys %{ $trans{$chr} } )
+                {                            # may on different strands
+                    for my $tss ( keys %{ $trans{$chr}{$strand} } ) {
+                        @{ $geneAnno{ $id++ } }{qw(chr tss name strand)} =
+                          ( $chr, $tss, $gene, $strand );
+                    }
+                }
+            }
+        }
+    }
+    else {                                   # merge for gene body
+        while ( my ( $gene, $ref ) = each %gene2trans ) {
+            my %trans;
+            for ( keys %$ref ) {
+                push
+                  @{ $trans{ $transAnno{$_}{chr} }{ $transAnno{$_}{strand} } },
+                  [ $transAnno{$_}{start}, $transAnno{$_}{end} ];
+            }
+            for my $chr ( keys %trans ) {    # transcripts may on different chrs
+                for my $strand ( keys %{ $trans{$chr} } )
+                {                            # may on different strands
+                    my @stends =
+                      sort { $a->[0] <=> $b->[0] } @{ $trans{$chr}{$strand} };
+                    my ( $start, $end ) = @{ +shift @stends };
+                    for my $se (@stends) {
+                        my ( $s, $e ) = @$se;
+                        if ( $s > $end ) {
+                            @{ $geneAnno{ $id++ } }
+                              {qw(chr start end name strand)} =
+                              ( $chr, $start, $end, $gene, $strand );
+                            ( $start, $end ) = ( $s, $e );
+                        }
+                        else {
+                            $end = $e if $end < $e;
+                        }
+                    }
+                    @{ $geneAnno{ $id++ } }{qw(chr start end name strand)} =
+                      ( $chr, $start, $end, $gene, $strand );
+                }
+            }
+        }
+    }
+    %transAnno = %geneAnno;
+}
+
+sub _read_gene_annotation_file_for_transcript {
+    open my $in, '<', $opts{gtf} or die "Can't open file '$opts{gtf}'.\n";
+    if ( $opts{gtf} =~ /\.bed$/i ) {    # gene annotation file in BED13 format
+        if ( $opts{transcript} ) {      # record transcript id
+            while (<$in>) {             # for bed, use line number as key
+                chomp;
+                my @t = split /\t/;
+                next
+                  unless not %geneList
+                  or exists $geneList{ $t[12] }
+                  or exists $geneList{ $t[3] };
+                @{ $transAnno{$.} }{qw(chr start end name strand)} =
+                  @t[ 0 .. 3, 5 ];
+                $transAnno{$.}{name} =~ s/_dup*$//;    # remove, if exists
+            }
+        }
+        else {                                         # record gene name
+            while (<$in>) {
+                chomp;
+                my @t = split /\t/;
+                next
+                  unless not %geneList
+                  or exists $geneList{ $t[12] }
+                  or exists $geneList{ $t[3] };
+                @{ $transAnno{$.} }{qw(chr start end name strand)} =
+                  @t[ 0 .. 2, 12, 5 ];
+                $gene2trans{ $t[12] }{$.} = undef;
+            }
+        }
+    }
+    else {    # gene annotation file in GTF format
+        my $index = 1;    # used as hash key for each transcript
+        my %present;      # recorded transcripts
+        if ( $opts{transcript} ) {
+            while (<$in>) {
+                chomp;
+                my @t = split /\t/;
+                next unless $t[2] eq 'exon';
+                my %items;
+                $t[8] =~ s/"//g;
+                for my $it ( split /;\s*/, $t[8] ) {
+                    my ( $i, $j ) = split /\s+/, $it, 2;
+                    $items{$i} = $j;
+                }
+                my $tid = $items{transcript_id};
+                my $gene = $items{gene_name} || $items{gene_id} || $tid;
+                next
+                  unless not %geneList
+                  or exists $geneList{$gene}
+                  or exists $geneList{$tid};
+                if ( exists $present{"$t[0]-$tid-$t[6]"} ) {
+                    $tid = $present{"$t[0]-$tid-$t[6]"};
+                    $transAnno{$tid}{start} = $t[3]
+                      if $transAnno{$tid}{start} > $t[3];
+                    $transAnno{$tid}{end} = $t[4]
+                      if $transAnno{$tid}{end} < $t[4];
+                }
+                else {
+                    $present{"$t[0]-$tid-$t[6]"} = ++$index;
+                    $tid                         = $index;
+                    $transAnno{$tid}{start}      = $t[3];
+                    $transAnno{$tid}{end}        = $t[4];
+                    $transAnno{$tid}{chr}        = $t[0];
+                    $transAnno{$tid}{strand}     = $t[6];
+                    $tid =~ s/_dup*$//;
+                    $transAnno{$tid}{name} = $tid;
+                }
+            }
+        }
+        else {
+            while (<$in>) {
+                chomp;
+                my @t = split /\t/;
+                next unless $t[2] eq 'exon';
+                my %items;
+                $t[8] =~ s/"//g;
+                for my $it ( split /;\s*/, $t[8] ) {
+                    my ( $i, $j ) = split /\s+/, $it, 2;
+                    $items{$i} = $j;
+                }
+                my $tid = $items{transcript_id};
+                my $gene = $items{gene_name} || $items{gene_id} || $tid;
+                next
+                  unless not %geneList
+                  or exists $geneList{$gene}
+                  or exists $geneList{$tid};
+                if ( exists $present{"$t[0]-$tid-$t[6]"} ) {
+                    $tid = $present{"$t[0]-$tid-$t[6]"};
+                    $transAnno{$tid}{start} = $t[3]
+                      if $transAnno{$tid}{start} > $t[3];
+                    $transAnno{$tid}{end} = $t[4]
+                      if $transAnno{$tid}{end} < $t[4];
+                }
+                else {
+                    $present{"$t[0]-$tid-$t[6]"} = ++$index;
+                    $tid                         = $index;
+                    $transAnno{$tid}{start}      = $t[3];
+                    $transAnno{$tid}{end}        = $t[4];
+                    $transAnno{$tid}{chr}        = $t[0];
+                    $transAnno{$tid}{strand}     = $t[6];
+                    $transAnno{$tid}{name}       = $gene;
+                    $gene2trans{$gene}{$tid}     = undef;
+                }
+            }
+        }
+    }
+    close $in;
+}
+
+sub _get_gene_list {
+    open my $in, '<', $opts{geneList}
+      or die "Can't open file '$opts{geneList}'.\n";
+    while (<$in>) {
+        chomp;
+        my ($gene) = split /\t/;
+        $geneList{$gene} = undef;
+    }
+    close $in;
+}
+
+__DATA__
+geneProfile     Make reads coverage profile for given genes on gene body and
+                extended promoter and downstream regions.
+
+Usage:  geneProfile -rd normalized.bg -o geneList.profile -g mm9.gtf -n mm9 \
+    [options]
+
+Options:
+-geneList, -l       <str>   [Optional]
+    Gene list file contains given genes in the first column. If given,
+    geneProfile will only generate profiles on these genes, else, generate
+    profiles on all genes found in -gtf. Gene names can either be offical gene
+    symbols or transcript IDs specified in -gtf.
+
+-reads, -rd         <str>   [NEEDED]
+    Reads file in BED format or in bedGraph format. If in BED format,
+    geneProfile will extend each read to length specified by -extendto and then
+    remove duplicated reads if -dup is set, then convert reads file into
+    bedGraph format and normalize by total reads number.
+
+-output, -o         <str>   [NEEDED]
+    Output profile name. This file will be a table file with first row is table
+    header and first one or four column(s) is/are region information.
+
+-position, -p       <>      [Optional]
+    If set, will output region information (genomic position) for each row. 
+    Default is not set.
+
+-gtf, -g            <str>   [Optional]
+    Gene annotation file. Both GTF format and BED13 format are supported. 
+    For GTF format, the Offical gene symbols are set by 'gene_name' keyword 
+    and transcript IDs are set by 'transcript_id' keyword in the 9th column. If
+    -transcript is set, 'transcript_id' is outputed, otherwise, 'gene_name' is
+    outputed, if no 'gene_name' avaiable, 'gene_id' is used for instead, if
+    'gene_id' is also missed, then 'transcript_id' is used for instead.
+    For BED13 format, the 13th column is treated as gene symbols, this file 
+    can be generated from GTF file using `gtfToBed` command.
+    Note that one and only one of -gtf and -region can be set!
+
+-region, -rg        <str>   [Optional]
+    BED file name to specify chromosomal regions to make profile instead from 
+    gene annotation file. Note that -region conflicts with -gtf. If -region is
+    set, -upstream, -downstream and -tss will be ignored.
+    Note that one and only one of -gtf and -region can be set!
+
+-genome, -n         <str>   [Optional]
+    Genome version such as 'hg19', 'mm9'. Only used when -reads is in BED format
+    or -upstream or -downstream or -tss is set. In this case, it is used to 
+    search chromSizes file.
+
+-regionbins, -rb    <int>   [DEFAULT:100] 
+    Set number of bins for each region specified by -region. Only used when 
+    -region is set. Default is 100.
+
+-tss                <>      [Optional]
+    If set, only generate profiles for regions around genes or transcripts TSS,
+    from upstream regions set by -tssup to downstream regions set by -tssdown,
+    otherwise, generate profiles for whole gene body and extended promoter and
+    downstream regions.
+
+-tssup, -tu         <int>   [DEFAULT:1000]
+    TSS upstream region. Only used when -tss is set. Note that this option is
+    different from -upstream, which specify the promoter regions used when -tss
+    is not set.
+
+-tssdown, -td       <int>   [DEFAULT:1000]
+    TSS downstream region. Only used when -tss is set. Note that this option is
+    different from -downstream, which specify the downstream regions from TED
+    and only used when -tss is not set.
+
+-tssbins, -tb        <int>  [DEFAULT:100]
+    Bin number for TSS around regions. Only used when -tss is set.
+
+-upstream, -u, -us   <int>   [DEFAULT:2000]
+    Specify promoter regions upstream from TSS used to generate profiles for
+    whole gene body and extended regions.
+
+-upbins, -ub        <int>   [DEFAULT:20]
+    Bin number for promoter regions. Only used when -upstream is a positive
+    integer.
+
+-downstream, -d, -ds <int>   [DEFAULT:1000]
+    Specify downstream regions distal from TES used to generate profiles for
+    whole gene body and extended regions.
+
+-downbins, -db      <int>   [DEFAULT:10]
+    Bin number for downstream regions. Only used when -downstream is a positive
+    integer.
+
+-genebins, -gb      <int>   [DEFAULT:70]
+    Bin number for whole gene body. Only used when -tss is not set. If
+    -transcript is set, gene body is specified from TSS to TES for each
+    transcript, otherwise, gene body is specified by the longest distance by
+    merging all transcripts from the same gene (that means, have the same
+    'gene_name' value).
+
+-transcript, -t     <>      [Optional]
+    If set, generate profiles for each transcript, default is generate profiles
+    for each gene.
+
+-extendto, -e       <int>   [DEFAULT:200]
+    Extend each read to this length. Only used when -reads is in BED format.
+
+-dup                <int>   [DEFAULT:0]
+    Duplication level allowed. Only used when -reas is in BED format. Default 0
+    means keep all reads.
+
+-genomenorm, -on    <int>   [Optional]
+    If set, nomalize the generated profiles by genome-wide (all given genes) 
+    maximum score, and make maximal score is equal to this value. The original
+    profile file will be kept at the same time.
+
+-genenorm, -en      <int>   [Optional]
+    If set, nomalize the generated profiles by gene-wide (for each gene) 
+    maximum score, and make maximal score is equal to this value (for each gene).
+    The original profile file will be kept at the same time. -genomenorm and
+    -genenorm can be set at the same time.
+
+

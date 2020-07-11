@@ -1,0 +1,55 @@
+#!/usr/bin/env python
+
+
+import sys
+
+def iced_norm(arglist):
+    """
+    Do ICE normalization for dense matrix file
+    Usage: iced_norm input output [total_counts]
+    File format:
+    The first column and row are treated as names for both input and output.
+    """
+    import numpy as np
+    from iced import normalization as nl
+
+    if len(arglist) == 3:
+        input, output, total_counts = arglist
+        total_counts = int(total_counts)
+    else:
+        input, output = arglist
+        total_counts = None
+    # read in input
+    rawMatrix = []
+    fh = open(input, 'r')
+    head = fh.readline()
+    for line in fh:
+        field = line.strip().split('\t')
+        field.pop(0) # remove row name
+        rawMatrix.append([int(i) for i in field])
+    fh.close()
+    # normalization
+    rawMatrix = np.array(rawMatrix)
+    if total_counts is None:
+        total_counts = rawMatrix.sum()
+    normed = nl.ICE_normalization(rawMatrix, max_iter=100)
+    normed /= normed.sum() / total_counts
+    # output
+    fh = open(output, 'w')
+    fh.write(head)
+    field = head.strip().split('\t')
+    field.pop(0) # remove row name
+    for i in range(0, len(field)):
+        fh.write(str(field[i]) + '\t')
+        l = normed[i].tolist()
+        fh.write('\t'.join('%.1f' % j for j in l) + '\n')
+    fh.close()
+
+
+if __name__ == '__main__':
+    sys.argv.pop(0) # remove script name
+    if len(sys.argv) < 2:
+        print("Usage: iced_norm input output [total_counts]")
+        print("If total_counts is not given, default normalize to the same number as input")
+        exit()
+    iced_norm(sys.argv)
