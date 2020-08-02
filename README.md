@@ -51,7 +51,7 @@ hicMapTools makegenom -c 4 -o hic-B6 -g mm10 -bs 100000
 hicMapTools ice -rm genomeBins.100kb.matrix -im iced.genomeBins.100kb.matrix -o hic-B6
 
 convert normalized matrix into WashU epigenome browser format:
-cd hic-$d/pets
+cd hic-B6/pets
 hicMapTools genomicMatrixToWashU -rm iced.genomeBins.100kb.matrix -rb genomeBins.100kb.bed -bz -o iced.100kb.washU.bed
 
 calculate boundary score by and call TAD boundaries:
